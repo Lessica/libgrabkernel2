@@ -27,7 +27,8 @@ static bool grab_kernelcache_via_link(NSString *boardconfig, FirmwareLink *link,
             ERRLOG("AEA OTA selected but AppleDB returned no decryption key\n");
             return false;
         }
-        return aea_fast_extract_kernelcache(link.url, link.decryptionKey, outPath, 0, nil, NULL);
+        return aea_fast_extract_kernelcache(link.url, link.decryptionKey, outPath,
+                                            boardconfig, 0, nil, NULL);
     }
     return download_kernelcache_for(boardconfig, link.url, link.isOTA, outPath);
 }

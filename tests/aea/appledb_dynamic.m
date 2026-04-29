@@ -8,17 +8,16 @@
 // resolve AppleDB's FirmwareLink internally and dispatch AEA links to the fast
 // path with the AppleDB-supplied decryptionKey.
 //
-// The boardconfig is intentionally invalid. The AEA fast path ignores it, while
-// the legacy IPSW/ZIP path needs a real boardconfig to find KernelCache in
-// BuildManifest.plist. A passing test therefore proves the public API reached
-// the AEA dispatch path rather than the old partial-zip path.
+// This exercises the same public boardconfig contract as the legacy IPSW/ZIP
+// path: BuildManifest.plist must be resolved and the matching DeviceClass
+// identity must select the kernelcache path.
 
 int main(int argc, const char *argv[]) {
     @autoreleasepool {
         NSString *osStr = argc > 1 ? [NSString stringWithUTF8String:argv[1]] : @"iOS";
         NSString *build = argc > 2 ? [NSString stringWithUTF8String:argv[2]] : @"22A3351";
         NSString *model = argc > 3 ? [NSString stringWithUTF8String:argv[3]] : @"iPhone17,1";
-        NSString *boardconfig = argc > 4 ? [NSString stringWithUTF8String:argv[4]] : @"InvalidBoardConfig";
+        NSString *boardconfig = argc > 4 ? [NSString stringWithUTF8String:argv[4]] : @"D93AP";
         if (!osStr.length || !build.length || !model.length || !boardconfig.length) {
             fprintf(stderr, "usage: %s [osStr build model boardconfig]\n", argv[0]);
             return 2;

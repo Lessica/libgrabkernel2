@@ -7,7 +7,7 @@
 //  Phase A — BuildManifest discovery.
 //    Walk the first couple of chunks linearly, capped at 32 frames each,
 //    looking for `AssetData/boot/BuildManifest.plist`. Decode the plist
-//    and pin the kernelcache filename (e.g. kernelcache.release.iphone14b).
+//    and pin the board-specific kernelcache filename.
 //    Failure is fatal; we don't speculatively scan downstream chunks.
 //
 //  Phase B — Linear scan with lex-stop and body-skip.
@@ -253,12 +253,13 @@ static BOOL aeaf_walk_range(AEAFClusterIndex *idx,
 }
 
 // =================================================================
-// Decode BuildManifest.plist body and pull kernelcache path.
+// Decode BuildManifest.plist body and pull the board-specific kernelcache path.
 // =================================================================
 static NSString *aeaf_extract_kernelcache_name(AEAFClusterIndex *idx,
                                                AEAFRangeOpener *opener,
                                                int64_t bodyStart,
-                                               int64_t bodyLen) {
+                                               int64_t bodyLen,
+                                               NSString *boardconfig) {
     if (bodyLen <= 0 || bodyLen > 16 * 1024 * 1024) return nil;
     NSError *err = nil;
     NSData *data = [idx readPlaintextAtOffset:bodyStart length:bodyLen
@@ -271,19 +272,36 @@ static NSString *aeaf_extract_kernelcache_name(AEAFClusterIndex *idx,
     if (![plist isKindOfClass:[NSDictionary class]]) return nil;
     NSArray *identities = plist[@"BuildIdentities"];
     if (![identities isKindOfClass:[NSArray class]]) return nil;
+    NSString *wantedDeviceClass = boardconfig.length ? boardconfig.lowercaseString : nil;
+    NSString *kernelCachePath = nil;
     for (NSDictionary *identity in identities) {
+        if (![identity isKindOfClass:[NSDictionary class]]) continue;
+        NSDictionary *info = identity[@"Info"];
+        if (![info isKindOfClass:[NSDictionary class]]) continue;
+        NSString *variant = info[@"Variant"];
+        if ([variant isKindOfClass:[NSString class]] && [variant hasPrefix:@"Research"]) {
+            continue;
+        }
+        NSString *deviceClass = info[@"DeviceClass"];
+        if (wantedDeviceClass.length) {
+            if (![deviceClass isKindOfClass:[NSString class]] ||
+                ![deviceClass isEqualToString:wantedDeviceClass]) {
+                continue;
+            }
+        }
         NSString *kp = identity[@"Manifest"][@"KernelCache"][@"Info"][@"Path"];
         if ([kp isKindOfClass:[NSString class]] && [kp containsString:@"kernelcache.release."]) {
-            return kp;
+            kernelCachePath = kp;
         }
     }
-    return nil;
+    return kernelCachePath;
 }
 
 // =================================================================
 BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
                                   NSString *decryptionKeyB64,
                                   NSString *outPath,
+                                  NSString *boardconfig,
                                   NSInteger chunkIndex,
                                   NSString *kernelPathSubstring,
                                   AEAFFastStats *outStats) {
@@ -346,13 +364,16 @@ BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
             (long)ci, bm.frameStart, bm.bodySize);
         NSString *kcName = aeaf_extract_kernelcache_name(idx, opener,
                                                           bm.frameStart + bm.headerSize,
-                                                          bm.bodySize);
+                                                          bm.bodySize,
+                                                          boardconfig);
         if (kcName.length) {
             targetPath = [BOOT_PREFIX stringByAppendingString:kcName];
             LOG("aea_fast: pinned target -> %s\n", targetPath.UTF8String);
             break;
         }
-        LOG("aea_fast: BuildManifest yielded no kernelcache path\n");
+        ERRLOG("aea_fast: BuildManifest yielded no kernelcache path for board=%s\n",
+               boardconfig.length ? boardconfig.UTF8String : "(any)");
+        return NO;
     }
     if (!targetPath) {
         ERRLOG("aea_fast: BuildManifest discovery failed in first %ld chunk(s)\n",

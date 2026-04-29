@@ -27,9 +27,12 @@ typedef struct {
 // `decryptionKeyB64` is the base64-encoded AEA symmetric key (AppleDB ships
 //   this in `links[].decryptionKey` for iOS 18+ OTAs).
 // `outPath` is the file to write the decompressed kernelcache to.
+// `boardconfig` selects the BuildManifest identity, matching the legacy
+//   partial-zip path's `DeviceClass == boardconfig.lowercaseString` behavior.
+//   Pass nil only for standalone probes that intentionally accept the first
+//   non-Research kernelcache identity.
 // `chunkIndex` controls chunk selection:
-//   0  = auto-scan (scans YOP_MANIFEST chunks for the kernelcache needle,
-//        falls back to chunk 4 if the scan finds nothing).
+//   0  = auto-scan YOP_MANIFEST chunks large enough to contain a kernelcache.
 //   >0 = use that specific chunk index directly.
 // `kernelPathSubstring` filters which YAA frame counts as the kernelcache.
 //   Pass nil for the default ("kernelcache.release.").
@@ -39,6 +42,7 @@ typedef struct {
 BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
                                   NSString *decryptionKeyB64,
                                   NSString *outPath,
+                                  NSString *_Nullable boardconfig,
                                   NSInteger chunkIndex,
                                   NSString *_Nullable kernelPathSubstring,
                                   AEAFFastStats *_Nullable outStats);

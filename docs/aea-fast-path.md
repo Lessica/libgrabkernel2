@@ -6,7 +6,7 @@ Across the current test matrix, extraction typically transfers ~42-60 MiB in ~20
 
 ## Production path
 
-All production code lives under [`src/aea/`](../src/aea). The entry point is `aea_fast_extract_kernelcache` in [`include/aea_fast.h`](../include/aea_fast.h). Public `grab_kernelcache_*` / `grabkernel.h` callers do not need to opt in: AppleDB marks OTA links with `isAEA`, provides the per-asset `decryptionKey`, and the existing grab flow dispatches AEA links to the fast path automatically.
+All production code lives under [`src/aea/`](../src/aea). The entry point is `aea_fast_extract_kernelcache` in [`include/aea_fast.h`](../include/aea_fast.h). Public `grab_kernelcache_*` / `grabkernel.h` callers do not need to opt in: AppleDB marks OTA links with `isAEA`, provides the per-asset `decryptionKey`, and the existing grab flow dispatches AEA links to the fast path automatically. AEA extraction still honors the original `boardconfig` contract by selecting the matching `BuildManifest.plist` identity before locating the kernelcache frame.
 
 Non-AEA assets continue to use the existing `libpartial` path.
 
@@ -43,10 +43,10 @@ make TARGET=macos
 The default arguments are:
 
 ```text
-iOS 22A3351 iPhone17,1 InvalidBoardConfig
+iOS 22A3351 iPhone17,1 D93AP
 ```
 
-The invalid boardconfig is intentional. It proves the public API did not fall back to the IPSW/ZIP path, because only the AEA OTA path can satisfy that test case.
+`D93AP` is the default boardconfig for this case. The test intentionally uses the public API so it verifies both AppleDB AEA URL/key resolution and the same board-specific BuildManifest selection used by the legacy IPSW/ZIP path.
 
 The latest dynamic AppleDB run resolved a `.aea` Full OTA with a key, dispatched to the fast path, and extracted the kernelcache with 29 HTTP requests / 54.69 MiB transferred.
 
