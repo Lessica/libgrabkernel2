@@ -51,6 +51,9 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
 }
 
 static FirmwareLink *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *sources, NSString *modelIdentifier) {
+    // Priority buckets: 0 = IPSW, 1 = plain OTA, 2 = AEA OTA (fallback)
+    FirmwareLink *candidates[3] = {nil, nil, nil};
+
     for (NSDictionary<NSString *, id> *source in sources) {
         if (![source[@"deviceMap"] containsObject:modelIdentifier]) {
             DBGLOG("Skipping source that does not include device: %s\n", [source[@"deviceMap"] componentsJoinedByString:@", "].UTF8String);
@@ -62,7 +65,9 @@ static FirmwareLink *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *>
             continue;
         }
 
-        if ([source[@"type"] isEqualToString:@"ota"] && source[@"prerequisiteBuild"]) {
+        BOOL isOTA = [source[@"type"] isEqualToString:@"ota"];
+
+        if (isOTA && source[@"prerequisiteBuild"]) {
             // ignore deltas
             DBGLOG("Skipping OTA source with prerequisite build: %s\n", [source[@"prerequisiteBuild"] UTF8String]);
             continue;
@@ -82,21 +87,35 @@ static FirmwareLink *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *>
 
             FirmwareLink *fl = [[FirmwareLink alloc] init];
             fl.url = link[@"url"];
-            fl.isOTA = [source[@"type"] isEqualToString:@"ota"];
+            fl.isOTA = isOTA;
             fl.isAEA = [url.pathExtension.lowercaseString isEqualToString:@"aea"];
             id key = link[@"decryptionKey"];
             if ([key isKindOfClass:[NSString class]]) {
                 fl.decryptionKey = key;
             }
-            LOG("Found firmware URL: %s (OTA: %s, AEA: %s, key: %s)\n",
-                fl.url.UTF8String,
-                fl.isOTA ? "yes" : "no",
-                fl.isAEA ? "yes" : "no",
-                fl.decryptionKey ? "yes" : "no");
-            return fl;
-        }
 
-        DBGLOG("No suitable links found for source: %s\n", [source[@"name"] UTF8String]);
+            int bucket = !isOTA ? 0 : (!fl.isAEA ? 1 : 2);
+            if (!candidates[bucket]) {
+                DBGLOG("Candidate (priority %d): %s (OTA: %s, AEA: %s, key: %s)\n",
+                    bucket,
+                    fl.url.UTF8String,
+                    fl.isOTA ? "yes" : "no",
+                    fl.isAEA ? "yes" : "no",
+                    fl.decryptionKey ? "yes" : "no");
+                candidates[bucket] = fl;
+            }
+        }
+    }
+
+    for (int i = 0; i < 3; i++) {
+        if (candidates[i]) {
+            LOG("Found firmware URL: %s (OTA: %s, AEA: %s, key: %s)\n",
+                candidates[i].url.UTF8String,
+                candidates[i].isOTA ? "yes" : "no",
+                candidates[i].isAEA ? "yes" : "no",
+                candidates[i].decryptionKey ? "yes" : "no");
+            return candidates[i];
+        }
     }
 
     return nil;
