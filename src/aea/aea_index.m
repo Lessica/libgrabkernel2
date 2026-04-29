@@ -56,7 +56,14 @@ static NSData *base64Decode(NSString *b64) {
     int64_t _prefixLen;
     int64_t _headerSecSize;
     int64_t _plainEnd;
+    // LRU cache of decrypted+decompressed segment plaintexts.
+    // Key: NSNumber boxing (uint64_t)((cluster.index << 32) | segIdx)
+    // _segCacheOrder is MRU-first.
+    NSMutableDictionary<NSNumber *, NSData *> *_segCache;
+    NSMutableArray<NSNumber *> *_segCacheOrder;
 }
+
+#define AEAF_SEG_CACHE_MAX 8
 
 - (AEAFRootHeader)rootHeader { return _rootHeader; }
 - (int64_t)prefixLen { return _prefixLen; }
@@ -66,8 +73,34 @@ static NSData *base64Decode(NSString *b64) {
 - (instancetype)init {
     if ((self = [super init])) {
         _clusterValues = [NSMutableArray array];
+        _segCache = [NSMutableDictionary dictionaryWithCapacity:AEAF_SEG_CACHE_MAX];
+        _segCacheOrder = [NSMutableArray arrayWithCapacity:AEAF_SEG_CACHE_MAX];
     }
     return self;
+}
+
+- (NSData *)cachedSegmentForKey:(NSNumber *)key {
+    NSData *d = _segCache[key];
+    if (!d) return nil;
+    [_segCacheOrder removeObject:key];
+    [_segCacheOrder insertObject:key atIndex:0];
+    return d;
+}
+
+- (void)cacheSegment:(NSData *)plain forKey:(NSNumber *)key {
+    if (!plain || plain.length == 0) return;
+    if (!_segCache[key]) {
+        if (_segCacheOrder.count >= AEAF_SEG_CACHE_MAX) {
+            NSNumber *evict = _segCacheOrder.lastObject;
+            [_segCacheOrder removeLastObject];
+            [_segCache removeObjectForKey:evict];
+        }
+        [_segCacheOrder insertObject:key atIndex:0];
+    } else {
+        [_segCacheOrder removeObject:key];
+        [_segCacheOrder insertObject:key atIndex:0];
+    }
+    _segCache[key] = plain;
 }
 
 - (void)dealloc {
@@ -379,92 +412,123 @@ static BOOL segRange(AEAFCluster *c, int64_t wantStart, int64_t wantEnd,
         if (!segRange(cluster, wantStart, wantEnd, segPer, &firstSeg, &lastSeg, &segSkip, &segCap)) {
             continue;
         }
-        // Compute compressed offset+span for this band.
-        int64_t preBytes = 0, spanBytes = 0;
-        for (int i = 0; i < (int)segPer; i++) {
-            AEAFSegmentHeader *s = &cluster->segments[i];
-            if (i < firstSeg) {
-                preBytes += s->compressed_size;
-                continue;
+
+        // Identify which segments in [firstSeg..lastSeg] are NOT cached.
+        // Fetch + decrypt only the contiguous run(s) of missing segments.
+        // To keep things simple, we fetch one tight range covering all
+        // missing segments in this band; cached ones are reused as-is.
+        int missLo = -1, missHi = -1;
+        for (int seg = firstSeg; seg <= lastSeg; seg++) {
+            uint64_t k = ((uint64_t)cluster->index << 32) | (uint32_t)seg;
+            NSNumber *key = @(k);
+            if (_segCache[key] == nil) {
+                if (missLo < 0) missLo = seg;
+                missHi = seg;
             }
-            if (i > lastSeg) break;
-            spanBytes += s->compressed_size;
-        }
-        int64_t rangeStart = cluster->cipher_body_start + preBytes;
-        NSData *bodyBlob = [opener readRangeAtOffset:rangeStart length:spanBytes error:outError];
-        if (!bodyBlob) return nil;
-        if ((int64_t)bodyBlob.length < spanBytes) {
-            if (outError) *outError = AEAFMakeError(AEAFErrorTruncated, @"cluster %u body short read", cluster->index);
-            return nil;
         }
 
-        // Derive cluster key for segments.
-        uint8_t ckInfo[6 + 4];
-        memcpy(ckInfo, "AEA_CK", 6);
-        for (int j = 0; j < 4; j++) ckInfo[6 + j] = (uint8_t)(cluster->index >> (j * 8));
+        NSData *bodyBlob = nil;
+        int64_t missBodyStart = 0;
+        if (missLo >= 0) {
+            int64_t preBytes = 0, spanBytes = 0;
+            for (int i = 0; i < (int)segPer; i++) {
+                AEAFSegmentHeader *s = &cluster->segments[i];
+                if (i < missLo) {
+                    preBytes += s->compressed_size;
+                    continue;
+                }
+                if (i > missHi) break;
+                spanBytes += s->compressed_size;
+            }
+            int64_t rangeStart = cluster->cipher_body_start + preBytes;
+            bodyBlob = [opener readRangeAtOffset:rangeStart length:spanBytes error:outError];
+            if (!bodyBlob) return nil;
+            if ((int64_t)bodyBlob.length < spanBytes) {
+                if (outError) *outError = AEAFMakeError(AEAFErrorTruncated, @"cluster %u body short read", cluster->index);
+                return nil;
+            }
+            missBodyStart = preBytes;
+        }
+
+        // Derive cluster key once per cluster (cheap but skip when no misses).
         uint8_t clusterKey[32];
-        if (!AEAFHKDFSHA256(_mainKey.bytes, 32, NULL, 0, ckInfo, sizeof(ckInfo), clusterKey, 32)) {
-            if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"derive cluster %u key", cluster->index);
-            return nil;
+        BOOL clusterKeyReady = NO;
+        if (missLo >= 0) {
+            uint8_t ckInfo[6 + 4];
+            memcpy(ckInfo, "AEA_CK", 6);
+            for (int j = 0; j < 4; j++) ckInfo[6 + j] = (uint8_t)(cluster->index >> (j * 8));
+            if (!AEAFHKDFSHA256(_mainKey.bytes, 32, NULL, 0, ckInfo, sizeof(ckInfo), clusterKey, 32)) {
+                if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"derive cluster %u key", cluster->index);
+                return nil;
+            }
+            clusterKeyReady = YES;
         }
 
-        const uint8_t *bodyPtr = bodyBlob.bytes;
+        // Walk band segments; pull from cache or decrypt+cache.
         int64_t bodyOff = 0;
         for (int seg = firstSeg; seg <= lastSeg; seg++) {
             AEAFSegmentHeader *sh = &cluster->segments[seg];
             uint32_t cSize = sh->compressed_size;
             uint32_t dSize = sh->decompressed_size;
-            if (cSize == 0 || dSize == 0) {
-                continue;
-            }
-            const uint8_t *segCipher = bodyPtr + bodyOff;
-            bodyOff += cSize;
+            if (cSize == 0 || dSize == 0) continue;
 
-            // Derive segment key.
-            uint8_t skInfo[6 + 4];
-            memcpy(skInfo, "AEA_SK", 6);
-            for (int j = 0; j < 4; j++) skInfo[6 + j] = (uint8_t)((uint32_t)seg >> (j * 8));
-            AEAFHeaderKey segKey;
-            if (!AEAFHKDFSHA256(clusterKey, 32, NULL, 0, skInfo, sizeof(skInfo), (uint8_t *)&segKey, sizeof(segKey))) {
-                if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"derive seg key");
-                return nil;
-            }
-            // Validate segment HMAC.
-            uint8_t calcMac[32];
-            if (!AEAFHMACVariant(segKey.mac, 32, NULL, 0, segCipher, cSize, calcMac)) {
-                if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"seg HMAC");
-                return nil;
-            }
-            if (memcmp(calcMac, cluster->segment_macs[seg], 32) != 0) {
-                if (outError) *outError = AEAFMakeError(AEAFErrorHMACMismatch, @"seg %d HMAC mismatch", seg);
-                return nil;
-            }
-            // Decrypt segment.
-            NSMutableData *segPlain = [NSMutableData dataWithLength:cSize];
-            if (!AEAFAES256CTR(segKey.key, segKey.iv, segCipher, cSize, segPlain.mutableBytes)) {
-                if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"seg CTR decrypt");
-                return nil;
-            }
-            // Decompress if needed.
-            NSData *segOut = nil;
-            if (cSize == dSize) {
-                segOut = segPlain;
-            } else {
-                NSMutableData *dec = [NSMutableData dataWithLength:dSize];
-                size_t written = 0;
-                if (!AEAFDecompressSegment(_rootHeader.compression,
-                                           segPlain.bytes, cSize,
-                                           dec.mutableBytes, dSize,
-                                           &written, outError)) {
+            uint64_t k = ((uint64_t)cluster->index << 32) | (uint32_t)seg;
+            NSNumber *cacheKey = @(k);
+            NSData *segOut = [self cachedSegmentForKey:cacheKey];
+
+            if (!segOut) {
+                // Locate this segment's cipher within bodyBlob.
+                int64_t segPre = 0;
+                for (int i = missLo; i < seg; i++) {
+                    segPre += cluster->segments[i].compressed_size;
+                }
+                const uint8_t *segCipher = (const uint8_t *)bodyBlob.bytes + segPre;
+                (void)bodyOff;
+
+                uint8_t skInfo[6 + 4];
+                memcpy(skInfo, "AEA_SK", 6);
+                for (int j = 0; j < 4; j++) skInfo[6 + j] = (uint8_t)((uint32_t)seg >> (j * 8));
+                AEAFHeaderKey segKey;
+                if (!clusterKeyReady ||
+                    !AEAFHKDFSHA256(clusterKey, 32, NULL, 0, skInfo, sizeof(skInfo),
+                                    (uint8_t *)&segKey, sizeof(segKey))) {
+                    if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"derive seg key");
                     return nil;
                 }
-                if (written != dSize) {
-                    if (outError) *outError = AEAFMakeError(AEAFErrorDecompress, @"seg decompress short: %zu vs %u", written, dSize);
+                uint8_t calcMac[32];
+                if (!AEAFHMACVariant(segKey.mac, 32, NULL, 0, segCipher, cSize, calcMac)) {
+                    if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"seg HMAC");
                     return nil;
                 }
-                segOut = dec;
+                if (memcmp(calcMac, cluster->segment_macs[seg], 32) != 0) {
+                    if (outError) *outError = AEAFMakeError(AEAFErrorHMACMismatch, @"seg %d HMAC mismatch", seg);
+                    return nil;
+                }
+                NSMutableData *segPlain = [NSMutableData dataWithLength:cSize];
+                if (!AEAFAES256CTR(segKey.key, segKey.iv, segCipher, cSize, segPlain.mutableBytes)) {
+                    if (outError) *outError = AEAFMakeError(AEAFErrorDecrypt, @"seg CTR decrypt");
+                    return nil;
+                }
+                if (cSize == dSize) {
+                    segOut = segPlain;
+                } else {
+                    NSMutableData *dec = [NSMutableData dataWithLength:dSize];
+                    size_t written = 0;
+                    if (!AEAFDecompressSegment(_rootHeader.compression,
+                                               segPlain.bytes, cSize,
+                                               dec.mutableBytes, dSize,
+                                               &written, outError)) {
+                        return nil;
+                    }
+                    if (written != dSize) {
+                        if (outError) *outError = AEAFMakeError(AEAFErrorDecompress, @"seg decompress short: %zu vs %u", written, dSize);
+                        return nil;
+                    }
+                    segOut = dec;
+                }
+                [self cacheSegment:segOut forKey:cacheKey];
             }
-            // Apply slicing on first/last segments.
+
             const uint8_t *segBytes = segOut.bytes;
             int64_t outStart = 0;
             int64_t outLen = (int64_t)segOut.length;
@@ -484,6 +548,7 @@ static BOOL segRange(AEAFCluster *c, int64_t wantStart, int64_t wantEnd,
                 [out appendBytes:segBytes + outStart length:(NSUInteger)outLen];
             }
         }
+        (void)missBodyStart;
     }
     return out;
 }

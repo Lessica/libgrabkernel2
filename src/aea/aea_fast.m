@@ -2,8 +2,26 @@
 //  aea_fast.m
 //  libgrabkernel2
 //
-//  Top-level: AEA prefix + YOP_MANIFEST + outer YAA + rolling-window inner
-//  YAA scan + targeted slice fetch + IM4P/LZFSE decompression -> output.
+//  Two-phase fast kernelcache extraction over AEA-encrypted YAA streams.
+//
+//  Phase A — BuildManifest discovery.
+//    Walk the first couple of chunks linearly, capped at 32 frames each,
+//    looking for `AssetData/boot/BuildManifest.plist`. Decode the plist
+//    and pin the kernelcache filename (e.g. kernelcache.release.iphone14b).
+//    Failure is fatal; we don't speculatively scan downstream chunks.
+//
+//  Phase B — Linear scan with lex-stop and body-skip.
+//    Walk every chunk large enough to plausibly contain a kernelcache
+//    (>= 8 MB) frame-by-frame. The rolling window only fetches frame
+//    headers and small bodies; large bodies are skipped without I/O
+//    (yaaSkip merely advances the logical cursor). When a frame's path
+//    sorts past `AssetData/boot/`, we stop early in that chunk.
+//
+//    NOTE: an earlier revision tried stride jumps with strong-magic
+//    probes; in practice every probe at an 8 MB stride landed inside
+//    a >256 KB body and produced a probe-miss, so each "jump" cost a
+//    wasted 256 KB request before falling back to linear scan. Linear
+//    walk_range is already near-optimal because body skips don't fetch.
 //
 
 #import <Foundation/Foundation.h>
@@ -11,14 +29,17 @@
 #import "aea_internal.h"
 #import "utils.h"
 
-#define DEFAULT_KERNEL_CHUNK 4
-#define DEFAULT_KERNEL_PATH @"kernelcache.release."
-#define WINDOW_CHUNK_SIZE   (256 * 1024)
+#define BOOT_PREFIX           @"AssetData/boot/"
+#define BUILD_MANIFEST_PATH   @"AssetData/boot/BuildManifest.plist"
 
-// yaaWindowReader: buffers AEA plaintext fetched in WINDOW_CHUNK_SIZE
-// chunks so the caller can read+skip across YAA frame boundaries while only
-// paying for the segment bands that overlap the window. Skipping a large
-// body advances the cursor without fetching cipher.
+#define WINDOW_CHUNK_SIZE     (2 * 1024 * 1024)   // 2 MB rolling window
+#define MIN_KC_CHUNK_BYTES    (8 * 1024 * 1024) // skip chunks too small to host kc
+#define PHASE_A_MAX_CHUNKS    4
+#define PHASE_A_MAX_FRAMES    32
+
+// =================================================================
+// Rolling window over the AEA plaintext stream.
+// =================================================================
 typedef struct {
     AEAFClusterIndex *idx;
     AEAFRangeOpener *opener;
@@ -26,7 +47,6 @@ typedef struct {
     int64_t end;          // exclusive end
     NSMutableData *buf;
     NSUInteger pos;
-    int64_t opens;
 } YAAWindow;
 
 static int64_t yaaTell(YAAWindow *w) {
@@ -40,23 +60,18 @@ static BOOL yaaEnsure(YAAWindow *w, NSUInteger n, NSError **outError) {
             return NO;
         }
         if (w->pos > 0) {
-            // Compact buffer.
             NSUInteger keep = w->buf.length - w->pos;
             memmove(w->buf.mutableBytes, (uint8_t *)w->buf.mutableBytes + w->pos, keep);
             [w->buf setLength:keep];
             w->pos = 0;
         }
         int64_t fetch = WINDOW_CHUNK_SIZE;
-        if (w->cur + fetch > w->end) {
-            fetch = w->end - w->cur;
-        }
+        if (w->cur + fetch > w->end) fetch = w->end - w->cur;
         NSData *data = [w->idx readPlaintextAtOffset:w->cur length:fetch opener:w->opener error:outError];
-        if (!data) return NO;
-        if (data.length == 0) {
-            if (outError) *outError = AEAFMakeError(AEAFErrorTruncated, @"YAA window: zero-length read");
+        if (!data || data.length == 0) {
+            if (!data && outError && !*outError) *outError = AEAFMakeError(AEAFErrorTruncated, @"window: read failed");
             return NO;
         }
-        w->opens++;
         [w->buf appendData:data];
         w->cur += data.length;
     }
@@ -72,10 +87,7 @@ static const uint8_t *yaaRead(YAAWindow *w, NSUInteger n, NSError **outError) {
 
 static void yaaSkip(YAAWindow *w, int64_t n) {
     int64_t avail = (int64_t)w->buf.length - (int64_t)w->pos;
-    if (n <= avail) {
-        w->pos += (NSUInteger)n;
-        return;
-    }
+    if (n <= avail) { w->pos += (NSUInteger)n; return; }
     n -= avail;
     [w->buf setLength:0];
     w->pos = 0;
@@ -83,19 +95,203 @@ static void yaaSkip(YAAWindow *w, int64_t n) {
     if (w->cur > w->end) w->cur = w->end;
 }
 
+// =================================================================
+// Frame hit metadata.
+// =================================================================
+typedef struct {
+    int64_t   frameStart;
+    int64_t   headerSize;
+    int64_t   bodySize;
+    char      type;
+    NSString *path;
+} AEAFFrameHit;
+
+// =================================================================
+// Resolve a chunk's inner range and pbzx flag.
+// =================================================================
+typedef struct {
+    int64_t innerStart;
+    int64_t innerEnd;
+    BOOL    pbzx;
+} AEAFInnerRange;
+
+static BOOL aeaf_resolve_inner_range(AEAFClusterIndex *idx,
+                                     AEAFRangeOpener *opener,
+                                     AEAFManifestEntry *entry,
+                                     int64_t manifestFrameSize,
+                                     AEAFInnerRange *out,
+                                     NSError **outError) {
+    int64_t chunkPlain = manifestFrameSize + entry.plainIdx;
+    NSData *outerHdr = [idx readPlaintextAtOffset:chunkPlain length:256
+                                            opener:opener error:outError];
+    if (!outerHdr || outerHdr.length < 6) return NO;
+    NSUInteger headerSize = 0, cursor = 0;
+    AEAFYAAEntry *outer = AEAFParseYAAFrameHeader(outerHdr, &cursor, &headerSize, outError);
+    if (!outer) {
+        uint16_t hsz = (uint16_t)((const uint8_t *)outerHdr.bytes)[4]
+                     | ((uint16_t)((const uint8_t *)outerHdr.bytes)[5] << 8);
+        if (hsz > outerHdr.length) {
+            outerHdr = [idx readPlaintextAtOffset:chunkPlain length:hsz
+                                            opener:opener error:outError];
+            if (!outerHdr) return NO;
+            cursor = 0;
+            outer = AEAFParseYAAFrameHeader(outerHdr, &cursor, &headerSize, outError);
+        }
+        if (!outer) return NO;
+    }
+    out->innerStart = chunkPlain + (int64_t)headerSize;
+    out->innerEnd   = out->innerStart + (int64_t)outer.size;
+
+    NSData *peek = [idx readPlaintextAtOffset:out->innerStart length:4
+                                        opener:opener error:outError];
+    if (!peek || peek.length < 4) return NO;
+    out->pbzx = (memcmp(peek.bytes, "pbzx", 4) == 0);
+    return YES;
+}
+
+// =================================================================
+// Linearly scan [start, end) for a frame whose path matches.
+// `targetExact` (if non-nil) wins; otherwise substring match against
+// `needleSubstr`. `wantBuildManifest` mode looks for BuildManifest
+// path equality. Returns YES on hit, NO on clean exhaustion.
+//
+// `outBMHit` receives BuildManifest body location when matched; the
+// caller decides whether to fetch+parse it.
+// =================================================================
+typedef enum {
+    AEAFScanModeBuildManifest = 0,
+    AEAFScanModeKernelcache   = 1,
+} AEAFScanMode;
+
+static BOOL aeaf_walk_range(AEAFClusterIndex *idx,
+                            AEAFRangeOpener *opener,
+                            int64_t startOff,
+                            int64_t endOff,
+                            AEAFScanMode mode,
+                            NSString *targetExact,
+                            int maxFrames,
+                            AEAFFrameHit *outHit,
+                            int *outFramesScanned,
+                            NSError **outError) {
+    YAAWindow win = {0};
+    win.idx = idx;
+    win.opener = opener;
+    win.cur = startOff;
+    win.end = endOff;
+    win.buf = [NSMutableData dataWithCapacity:WINDOW_CHUNK_SIZE * 2];
+    win.pos = 0;
+
+    int frames = 0;
+    while (1) {
+        int64_t frameStart = yaaTell(&win);
+        if (frameStart >= endOff) break;
+        if (maxFrames > 0 && frames >= maxFrames) {
+            DBGLOG("walk_range: hit maxFrames=%d at offset %lld\n", maxFrames, frameStart);
+            break;
+        }
+        const uint8_t *head = yaaRead(&win, 6, outError);
+        if (!head) return NO;
+        if (memcmp(head, "AA01", 4) != 0 && memcmp(head, "YAA1", 4) != 0) {
+            if (outError) *outError = AEAFMakeError(AEAFErrorBadFormat, @"bad YAA magic at %lld", frameStart);
+            return NO;
+        }
+        uint16_t hdrSize = (uint16_t)head[4] | ((uint16_t)head[5] << 8);
+        if (hdrSize <= 6) {
+            if (outError) *outError = AEAFMakeError(AEAFErrorBadFormat, @"hdrSize too small at %lld", frameStart);
+            return NO;
+        }
+        const uint8_t *rest = yaaRead(&win, hdrSize - 6, outError);
+        if (!rest) return NO;
+        NSData *bodyView = [NSData dataWithBytesNoCopy:(void *)rest
+                                                length:(NSUInteger)hdrSize - 6
+                                          freeWhenDone:NO];
+        NSMutableData *synth = [NSMutableData dataWithCapacity:hdrSize];
+        const uint8_t magic[6] = {'A','A','0','1', (uint8_t)(hdrSize & 0xff), (uint8_t)(hdrSize >> 8)};
+        [synth appendBytes:magic length:6];
+        [synth appendData:bodyView];
+        NSUInteger c2 = 0, h2 = 0;
+        AEAFYAAEntry *ent = AEAFParseYAAFrameHeader(synth, &c2, &h2, outError);
+        if (!ent) return NO;
+        frames++;
+
+        BOOL match = NO;
+        if (mode == AEAFScanModeBuildManifest) {
+            match = (ent.type == 'F' && [ent.path isEqualToString:BUILD_MANIFEST_PATH]);
+        } else {
+            match = (ent.type == 'F' && targetExact && [ent.path isEqualToString:targetExact]);
+        }
+        if (match) {
+            outHit->frameStart = frameStart;
+            outHit->headerSize = (int64_t)hdrSize;
+            outHit->bodySize   = (int64_t)ent.size;
+            outHit->type       = ent.type;
+            outHit->path       = ent.path;
+            if (outFramesScanned) *outFramesScanned = frames;
+            return YES;
+        }
+
+        // Lex-stop within this chunk: every chunk's inner stream is
+        // path-sorted, so once we cross past AssetData/boot/ on a non-D
+        // entry we can stop (boot dir entries themselves are 'D' which
+        // sort before files).
+        if (mode == AEAFScanModeKernelcache && ent.type == 'F'
+            && ent.path && [ent.path compare:BOOT_PREFIX] == NSOrderedDescending
+            && ![ent.path hasPrefix:BOOT_PREFIX]) {
+            DBGLOG("walk_range: '%s' past boot/, stopping\n", ent.path.UTF8String);
+            break;
+        }
+        if (mode == AEAFScanModeBuildManifest && ent.type == 'F'
+            && ent.path && [ent.path compare:BUILD_MANIFEST_PATH] == NSOrderedDescending) {
+            DBGLOG("walk_range: BuildManifest mode, '%s' past target, stopping\n", ent.path.UTF8String);
+            break;
+        }
+
+        yaaSkip(&win, (int64_t)ent.size);
+    }
+    if (outFramesScanned) *outFramesScanned = frames;
+    return NO;
+}
+
+// =================================================================
+// Decode BuildManifest.plist body and pull kernelcache path.
+// =================================================================
+static NSString *aeaf_extract_kernelcache_name(AEAFClusterIndex *idx,
+                                               AEAFRangeOpener *opener,
+                                               int64_t bodyStart,
+                                               int64_t bodyLen) {
+    if (bodyLen <= 0 || bodyLen > 16 * 1024 * 1024) return nil;
+    NSError *err = nil;
+    NSData *data = [idx readPlaintextAtOffset:bodyStart length:bodyLen
+                                        opener:opener error:&err];
+    if (!data || data.length == 0) return nil;
+    NSDictionary *plist = [NSPropertyListSerialization propertyListWithData:data
+                                                                    options:0
+                                                                     format:NULL
+                                                                      error:&err];
+    if (![plist isKindOfClass:[NSDictionary class]]) return nil;
+    NSArray *identities = plist[@"BuildIdentities"];
+    if (![identities isKindOfClass:[NSArray class]]) return nil;
+    for (NSDictionary *identity in identities) {
+        NSString *kp = identity[@"Manifest"][@"KernelCache"][@"Info"][@"Path"];
+        if ([kp isKindOfClass:[NSString class]] && [kp containsString:@"kernelcache.release."]) {
+            return kp;
+        }
+    }
+    return nil;
+}
+
+// =================================================================
 BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
                                   NSString *decryptionKeyB64,
                                   NSString *outPath,
                                   NSInteger chunkIndex,
-                                  NSString *kernelPathSubstring) {
+                                  NSString *kernelPathSubstring,
+                                  AEAFFastStats *outStats) {
+    (void)kernelPathSubstring; // honored only as a fallback; not used now.
     if (!aeaURL.length || !decryptionKeyB64.length || !outPath.length) {
         ERRLOG("aea_fast: missing required argument\n");
         return NO;
     }
-    if (chunkIndex <= 0) chunkIndex = DEFAULT_KERNEL_CHUNK;
-    NSString *needle = kernelPathSubstring.length > 0 ? kernelPathSubstring : DEFAULT_KERNEL_PATH;
-
-    LOG("Fast AEA kernelcache: %s (chunk %ld)\n", aeaURL.UTF8String, (long)chunkIndex);
 
     AEAFRangeOpener *opener = [[AEAFRangeOpener alloc] initWithURL:aeaURL];
     NSError *err = nil;
@@ -106,11 +302,8 @@ BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
         ERRLOG("aea_fast: prepare prefix failed: %s\n", err.localizedDescription.UTF8String);
         return NO;
     }
-    NSInteger prefixCalls = opener.requestCount;
-    int64_t prefixBytes = opener.bytesTransferred;
-
-    // Manifest sits at plaintext offset 0.
-    NSData *mfData = [idx readPlaintextAtOffset:0 length:16 * 1024 opener:opener error:&err];
+    NSData *mfData = [idx readPlaintextAtOffset:0 length:16 * 1024
+                                          opener:opener error:&err];
     if (!mfData) {
         ERRLOG("aea_fast: read manifest slice: %s\n", err.localizedDescription.UTF8String);
         return NO;
@@ -121,154 +314,107 @@ BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
         ERRLOG("aea_fast: parse YOP_MANIFEST: %s\n", err.localizedDescription.UTF8String);
         return NO;
     }
-    if (chunkIndex >= (NSInteger)manifest.count) {
-        ERRLOG("aea_fast: chunk %ld out of range (manifest has %lu)\n",
-               (long)chunkIndex, (unsigned long)manifest.count);
-        return NO;
-    }
-    NSInteger manifestCalls = opener.requestCount - prefixCalls;
-    int64_t manifestBytes = opener.bytesTransferred - prefixBytes;
-    (void)manifestCalls; (void)manifestBytes;
-    DBGLOG("Stage 2 manifest: requests=%ld bytes=%lld entries=%lu\n",
-           (long)manifestCalls, manifestBytes, (unsigned long)manifest.count);
+    LOG("aea_fast: %lu manifest entries\n", (unsigned long)manifest.count);
 
-    AEAFManifestEntry *targetChunk = manifest[chunkIndex];
-    int64_t chunkPlain = manifestFrameSize + targetChunk.plainIdx;
-    int64_t chunkPlainSize = targetChunk.size + 34; // include outer YAA frame header
-    (void)chunkPlainSize;
-    DBGLOG("Target chunk %ld: plain_start=%lld plain_size=%lld label=%s\n",
-           (long)chunkIndex, chunkPlain, chunkPlainSize, targetChunk.label.UTF8String);
-
-    // Read outer YAA header.
-    NSData *outerHdr = [idx readPlaintextAtOffset:chunkPlain length:256 opener:opener error:&err];
-    if (!outerHdr || outerHdr.length < 6) {
-        ERRLOG("aea_fast: read outer header: %s\n", err.localizedDescription.UTF8String);
-        return NO;
-    }
-    NSUInteger headerSize = 0, cursor = 0;
-    AEAFYAAEntry *outer = AEAFParseYAAFrameHeader(outerHdr, &cursor, &headerSize, &err);
-    if (!outer) {
-        // Maybe outer header > 256 bytes; refetch.
-        if (outerHdr.length >= 6) {
-            uint16_t hsz = (uint16_t)((const uint8_t *)outerHdr.bytes)[4]
-                         | ((uint16_t)((const uint8_t *)outerHdr.bytes)[5] << 8);
-            if (hsz > outerHdr.length) {
-                outerHdr = [idx readPlaintextAtOffset:chunkPlain length:hsz opener:opener error:&err];
-                if (!outerHdr) {
-                    ERRLOG("aea_fast: re-read outer header: %s\n", err.localizedDescription.UTF8String);
-                    return NO;
-                }
-                cursor = 0;
-                outer = AEAFParseYAAFrameHeader(outerHdr, &cursor, &headerSize, &err);
-            }
+    // ---- Phase A: BuildManifest discovery ----
+    NSString *targetPath = nil;
+    NSInteger phaseAChunks = MIN((NSInteger)manifest.count, (NSInteger)PHASE_A_MAX_CHUNKS);
+    for (NSInteger ci = 0; ci < phaseAChunks; ci++) {
+        AEAFInnerRange r = {0};
+        if (!aeaf_resolve_inner_range(idx, opener, manifest[ci], manifestFrameSize, &r, &err)) {
+            LOG("aea_fast: phase A chunk %ld outer header unreadable\n", (long)ci);
+            continue;
         }
-        if (!outer) {
-            ERRLOG("aea_fast: decode outer entry: %s\n", err.localizedDescription.UTF8String);
-            return NO;
+        if (r.pbzx) {
+            LOG("aea_fast: phase A chunk %ld pbzx-wrapped, skipping\n", (long)ci);
+            continue;
         }
-    }
-    int64_t innerStart = chunkPlain + (int64_t)headerSize;
-    int64_t innerEnd = innerStart + (int64_t)outer.size;
-    DBGLOG("Stage 3 outer: hdr_size=%zu body_size=%llu inner_start=%lld inner_end=%lld\n",
-           (size_t)headerSize, (unsigned long long)outer.size, innerStart, innerEnd);
-
-    // Detect pbzx wrapper.
-    NSData *peek = [idx readPlaintextAtOffset:innerStart length:4 opener:opener error:&err];
-    if (!peek || peek.length < 4) {
-        ERRLOG("aea_fast: peek inner: %s\n", err.localizedDescription.UTF8String);
-        return NO;
-    }
-    if (memcmp(peek.bytes, "pbzx", 4) == 0) {
-        ERRLOG("aea_fast: chunk %ld body is pbzx-wrapped (not supported)\n", (long)chunkIndex);
-        return NO;
-    }
-
-    // Walk inner YAA frames in a rolling window.
-    YAAWindow win = {0};
-    win.idx = idx;
-    win.opener = opener;
-    win.cur = innerStart;
-    win.end = innerEnd;
-    win.buf = [NSMutableData dataWithCapacity:WINDOW_CHUNK_SIZE * 2];
-    win.pos = 0;
-
-    int64_t kcStart = -1;
-    int64_t kcSize = 0;
-    NSString *kcPath = nil;
-    int framesSeen = 0;
-    NSInteger probeStartC = opener.requestCount;
-    int64_t probeStartB = opener.bytesTransferred;
-
-    while (1) {
-        int64_t frameStart = yaaTell(&win);
-        if (frameStart >= innerEnd) break;
-        const uint8_t *head = yaaRead(&win, 6, &err);
-        if (!head) {
-            ERRLOG("aea_fast: read inner frame head at %lld: %s\n", frameStart, err.localizedDescription.UTF8String);
-            return NO;
+        LOG("aea_fast: phase A scanning chunk %ld inner=[%lld..%lld) %lld B\n",
+            (long)ci, r.innerStart, r.innerEnd, r.innerEnd - r.innerStart);
+        AEAFFrameHit bm = {0};
+        int frames = 0;
+        NSError *werr = nil;
+        BOOL hit = aeaf_walk_range(idx, opener, r.innerStart, r.innerEnd,
+                                   AEAFScanModeBuildManifest, nil,
+                                   PHASE_A_MAX_FRAMES, &bm, &frames, &werr);
+        if (!hit) {
+            LOG("aea_fast: phase A chunk %ld no BuildManifest in first %d frames\n",
+                (long)ci, frames);
+            continue;
         }
-        if (memcmp(head, "AA01", 4) != 0 && memcmp(head, "YAA1", 4) != 0) {
-            ERRLOG("aea_fast: bad inner YAA magic at %lld\n", frameStart);
-            return NO;
-        }
-        uint16_t hdrSize = (uint16_t)head[4] | ((uint16_t)head[5] << 8);
-        if (hdrSize <= 6) {
-            ERRLOG("aea_fast: bad inner hdr size %u at %lld\n", hdrSize, frameStart);
-            return NO;
-        }
-        const uint8_t *rest = yaaRead(&win, hdrSize - 6, &err);
-        if (!rest) {
-            ERRLOG("aea_fast: read inner frame body at %lld: %s\n", frameStart, err.localizedDescription.UTF8String);
-            return NO;
-        }
-        AEAFYAAEntry *ent = [[AEAFYAAEntry alloc] init];
-        NSData *bodyView = [NSData dataWithBytesNoCopy:(void *)rest length:(NSUInteger)hdrSize - 6 freeWhenDone:NO];
-        // decodeYAAEntryBody is private to aea_yop.m; reuse via parsing one
-        // synthetic frame from a small NSData blob.
-        NSMutableData *synth = [NSMutableData dataWithCapacity:hdrSize];
-        const uint8_t magic[6] = {'A','A','0','1', (uint8_t)(hdrSize & 0xff), (uint8_t)(hdrSize >> 8)};
-        [synth appendBytes:magic length:6];
-        [synth appendData:bodyView];
-        NSUInteger c2 = 0, h2 = 0;
-        ent = AEAFParseYAAFrameHeader(synth, &c2, &h2, &err);
-        if (!ent) {
-            ERRLOG("aea_fast: decode inner entry at %lld: %s\n", frameStart, err.localizedDescription.UTF8String);
-            return NO;
-        }
-        framesSeen++;
-        DBGLOG("YAA frame #%d offset=%lld path=%s size=%llu type=%c\n",
-               framesSeen, frameStart, ent.path.UTF8String ?: "(nil)",
-               (unsigned long long)ent.size, ent.type);
-
-        if (ent.type == 'F' && ent.path && [ent.path containsString:needle]) {
-            kcStart = frameStart;
-            kcSize = (int64_t)hdrSize + (int64_t)ent.size;
-            kcPath = ent.path;
+        LOG("aea_fast: phase A chunk %ld BuildManifest.plist @%lld (size=%lld)\n",
+            (long)ci, bm.frameStart, bm.bodySize);
+        NSString *kcName = aeaf_extract_kernelcache_name(idx, opener,
+                                                          bm.frameStart + bm.headerSize,
+                                                          bm.bodySize);
+        if (kcName.length) {
+            targetPath = [BOOT_PREFIX stringByAppendingString:kcName];
+            LOG("aea_fast: pinned target -> %s\n", targetPath.UTF8String);
             break;
         }
-        yaaSkip(&win, (int64_t)ent.size);
+        LOG("aea_fast: BuildManifest yielded no kernelcache path\n");
     }
-    if (kcStart < 0) {
-        ERRLOG("aea_fast: kernelcache not found in chunk %ld (scanned %d frames)\n",
-               (long)chunkIndex, framesSeen);
+    if (!targetPath) {
+        ERRLOG("aea_fast: BuildManifest discovery failed in first %ld chunk(s)\n",
+               (long)phaseAChunks);
         return NO;
     }
-    NSInteger probeCalls = opener.requestCount - probeStartC;
-    int64_t probeBytes = opener.bytesTransferred - probeStartB;
-    (void)probeCalls;
-    DBGLOG("Stage 4 probe: frames=%d windows=%lld requests=%ld bytes=%lld\n",
-           framesSeen, win.opens, (long)probeCalls, probeBytes);
-    LOG("Located kernelcache: %s (size=%lld at +%lld)\n",
-        kcPath.UTF8String, kcSize, kcStart);
 
-    // Fetch the kernelcache YAA frame.
-    NSData *kcFrame = [idx readPlaintextAtOffset:kcStart length:kcSize opener:opener error:&err];
-    if (!kcFrame) {
-        ERRLOG("aea_fast: fetch kc frame: %s\n", err.localizedDescription.UTF8String);
+    // ---- Phase B: jump search for the pinned kernelcache path ----
+    NSMutableArray<NSNumber *> *order = [NSMutableArray array];
+    if (chunkIndex > 0) {
+        [order addObject:@(chunkIndex)];
+    } else {
+        for (NSInteger ci = 0; ci < (NSInteger)manifest.count; ci++) {
+            if (manifest[ci].size < MIN_KC_CHUNK_BYTES) continue;
+            [order addObject:@(ci)];
+        }
+    }
+
+    int64_t kcStart = -1, kcSize = 0;
+    NSString *kcPath = nil;
+    NSInteger usedChunk = -1;
+    for (NSNumber *n in order) {
+        NSInteger ci = n.integerValue;
+        AEAFInnerRange r = {0};
+        if (!aeaf_resolve_inner_range(idx, opener, manifest[ci], manifestFrameSize, &r, &err)) {
+            LOG("aea_fast: phase B chunk %ld unreadable, skipping\n", (long)ci);
+            continue;
+        }
+        if (r.pbzx) {
+            LOG("aea_fast: phase B chunk %ld pbzx-wrapped, skipping\n", (long)ci);
+            continue;
+        }
+        LOG("aea_fast: phase B chunk %ld inner=[%lld..%lld) %lld B\n",
+            (long)ci, r.innerStart, r.innerEnd, r.innerEnd - r.innerStart);
+        AEAFFrameHit hit = {0};
+        int frames = 0;
+        NSError *werr = nil;
+        if (aeaf_walk_range(idx, opener, r.innerStart, r.innerEnd,
+                            AEAFScanModeKernelcache, targetPath, 0,
+                            &hit, &frames, &werr)) {
+            kcStart   = hit.frameStart;
+            kcSize    = hit.headerSize + hit.bodySize;
+            kcPath    = hit.path;
+            usedChunk = ci;
+            break;
+        }
+        LOG("aea_fast: phase B chunk %ld scanned %d frames, no match\n", (long)ci, frames);
+    }
+    if (usedChunk < 0) {
+        ERRLOG("aea_fast: kernelcache '%s' not found in any chunk\n", targetPath.UTF8String);
         return NO;
     }
-    if (kcFrame.length < 6) {
-        ERRLOG("aea_fast: kc frame too short\n");
+    LOG("aea_fast: located %s in chunk %ld @%lld (size=%lld)\n",
+        kcPath.UTF8String, (long)usedChunk, kcStart, kcSize);
+
+    NSInteger probeCalls = opener.requestCount;
+    int64_t   probeBytes = opener.bytesTransferred;
+
+    NSData *kcFrame = [idx readPlaintextAtOffset:kcStart length:kcSize
+                                          opener:opener error:&err];
+    if (!kcFrame || kcFrame.length < 6) {
+        ERRLOG("aea_fast: fetch kc frame: %s\n", err.localizedDescription.UTF8String);
         return NO;
     }
     const uint8_t *kfp = kcFrame.bytes;
@@ -278,7 +424,6 @@ BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
         return NO;
     }
     NSData *im4p = [kcFrame subdataWithRange:NSMakeRange(kHdrSize, kcFrame.length - kHdrSize)];
-
     NSData *payload = AEAFExtractIM4PPayload(im4p, &err);
     if (!payload) {
         ERRLOG("aea_fast: parse IM4P: %s\n", err.localizedDescription.UTF8String);
@@ -289,16 +434,24 @@ BOOL aea_fast_extract_kernelcache(NSString *aeaURL,
         ERRLOG("aea_fast: decompress kernelcache: %s\n", err.localizedDescription.UTF8String);
         return NO;
     }
-
     NSError *werr = nil;
     if (![kcDec writeToFile:outPath options:NSDataWritingAtomic error:&werr]) {
         ERRLOG("aea_fast: write %s: %s\n", outPath.UTF8String, werr.localizedDescription.UTF8String);
         return NO;
     }
 
-    LOG("Fast AEA kernelcache: %s written (%lu bytes; transferred=%lld over %ld requests; probe=%lld fetch=%lld)\n",
+    int64_t   fetchBytes = opener.bytesTransferred - probeBytes;
+    NSInteger fetchCalls = opener.requestCount - probeCalls;
+    LOG("Fast AEA kernelcache: %s written (%lu bytes; %lld B / %ld reqs total; probe=%lld fetch=%lld)\n",
         outPath.UTF8String, (unsigned long)kcDec.length,
         opener.bytesTransferred, (long)opener.requestCount,
-        probeBytes, opener.bytesTransferred - probeStartB - probeBytes);
+        probeBytes, fetchBytes);
+    (void)fetchCalls;
+
+    if (outStats) {
+        outStats->requestCount     = opener.requestCount;
+        outStats->bytesTransferred = opener.bytesTransferred;
+        outStats->chunkIndexUsed   = usedChunk;
+    }
     return YES;
 }

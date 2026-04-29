@@ -19,4 +19,17 @@ Huge credit to [dhinakg](https://github.com/dhinakg) for reimplementing the API 
 
 iOS 18+ kernelcaches ship inside encrypted [AEA](https://developer.apple.com/documentation/applearchive) OTA assets that can exceed 7 GiB. This fork adds a streaming HTTP-Range path so `grab_kernelcache_*` can extract only the kernelcache chunk (~60 MiB) without downloading the full asset. The public ABI is unchanged.
 
-See [docs/aea-fast-path.md](docs/aea-fast-path.md) for the design and implementation details.
+### At a glance
+
+Tested on real Apple CDN Full OTAs across 29 build/device combinations (iOS 18.0 – 26.4.2). Comparison vs. naive full download:
+
+| Metric | Full asset download | Fast path |
+| --- | --- | --- |
+| Bytes transferred (typical) | 7.0 – 7.7 GiB | ~42 – 60 MiB |
+| HTTP requests | 1 | ~20 – 31 |
+| Time-to-kernelcache | minutes | seconds |
+| Disk usage | full OTA buffered | none (streamed) |
+
+Pass rate: **9/9 iOS 18.x** + **20/20 iOS 26.x** = **29/29** at the time of writing.
+
+See [docs/aea-fast-path.md](docs/aea-fast-path.md) for the design, implementation details, and the full per-build measurements.
