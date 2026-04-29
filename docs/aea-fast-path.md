@@ -12,12 +12,12 @@ Non-AEA assets continue to use the existing `libpartial` path.
 
 | Module | Responsibility |
 | --- | --- |
-| `aea_crypto.m` | HKDF-SHA256, AES-256 CTR, and the AEA HMAC variant `HMAC(key, salt || data || u64_le(salt_len))`. |
+| `aea_crypto.m` | HKDF-SHA256, AES-256 CTR, and the AEA HMAC variant `HMAC(key, salt \|\| data \|\| u64_le(salt_len))`. |
 | `aea_range.m` | `AEAFRangeOpener`: `NSURLSession` Range fetcher with retry plus byte/request counters. |
 | `aea_index.m` | `AEAFClusterIndex`: parses the AEA prefix, walks cluster headers on demand, and decrypts plaintext slices by segment. |
 | `aea_yop.m` | YAA frame decoder and `YOP_MANIFEST` parser used to locate chunk plaintext offsets. |
 | `aea_im4p.m` | IM4P ASN.1 walker and `Compression` framework segment decompressor. |
-| `aea_fast.m` | Prefix -> manifest -> outer YAA -> rolling-window inner YAA scan -> kernelcache slice fetch -> IM4P -> decompress -> write. |
+| `aea_fast.m` | Prefix → manifest → outer YAA → rolling-window inner YAA scan → kernelcache slice fetch → IM4P → decompress → write. |
 
 AppleDB integration keeps the public `appledb.h` ABI unchanged. The AEA key is carried through the library-private [`src/appledb_internal.h`](../src/appledb_internal.h) API.
 
