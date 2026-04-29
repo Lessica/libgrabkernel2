@@ -6,8 +6,8 @@ CC := clang
 
 TARGET ?= ios
 
-CFLAGS ?= -Wall -Werror -Wno-unused-command-line-argument -Iinclude -I_external/include -fPIC -fobjc-arc -O3
-LDFLAGS ?= -framework Foundation -framework Security -L_external/lib/$(TARGET) -lz -lcompression -lpartial
+CFLAGS ?= -Wall -Werror -Wno-unused-command-line-argument -Iinclude -I_external -fPIC -fobjc-arc -O3
+LDFLAGS ?= -framework Foundation -framework Security -lz -lcompression
 
 ifeq ($(TARGET), macos)
 CFLAGS += -arch x86_64 -arch arm64 -mmacosx-version-min=11.0
@@ -39,6 +39,7 @@ DYNAMIC_LIB := $(LIB_DIR)/$(LIB_NAME).dylib
 SRC_DIR := src
 SRC_FILES := $(wildcard $(SRC_DIR)/*.m) $(wildcard $(SRC_DIR)/aea/*.m)
 OBJ_FILES := $(patsubst $(SRC_DIR)/%.m, $(BUILD_DIR)/%.o, $(SRC_FILES))
+OBJ_FILES += $(BUILD_DIR)/_external/partial/partial.o
 
 DISABLE_TESTS ?= 0
 
@@ -63,6 +64,10 @@ $(DYNAMIC_LIB): $(OBJ_FILES)
 	@ldid -S $@
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.m
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(LDFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/_external/partial/partial.o: _external/partial/partial.m
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) $(LDFLAGS) -c $< -o $@
 
