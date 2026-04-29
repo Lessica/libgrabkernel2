@@ -14,3 +14,9 @@ Run `make` in the root directory.
 The build products and headers will be in the `output` directory.
 
 Huge credit to [dhinakg](https://github.com/dhinakg) for reimplementing the API parsing in Objective-C (as it was originally in Swift).
+
+## AEA OTA fast path
+
+iOS 18+ kernelcaches ship inside encrypted [AEA](https://developer.apple.com/documentation/applearchive) OTA assets that can exceed 7 GiB. This fork adds a streaming HTTP-Range path so `grab_kernelcache_*` can extract only the kernelcache chunk (~60 MiB) without downloading the full asset. The public ABI is unchanged.
+
+See [docs/aea-fast-path.md](docs/aea-fast-path.md) for the design and implementation details.

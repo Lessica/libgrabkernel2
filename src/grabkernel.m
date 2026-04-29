@@ -10,8 +10,27 @@
 #include <partial/partial.h>
 #include <string.h>
 #include <sys/sysctl.h>
+#include "aea_fast.h"
 #include "appledb.h"
+#include "appledb_internal.h"
 #include "utils.h"
+
+// Dispatches an AppleDB-resolved FirmwareLink to either the AEA fast path
+// (HTTP-Range + targeted decrypt) or the existing partial-zip path.
+static bool grab_kernelcache_via_link(NSString *boardconfig, FirmwareLink *link, NSString *outPath) {
+    if (!link) {
+        ERRLOG("Failed to get firmware URL!\n");
+        return false;
+    }
+    if (link.isAEA) {
+        if (!link.decryptionKey.length) {
+            ERRLOG("AEA OTA selected but AppleDB returned no decryption key\n");
+            return false;
+        }
+        return aea_fast_extract_kernelcache(link.url, link.decryptionKey, outPath, 0, nil);
+    }
+    return download_kernelcache_for(boardconfig, link.url, link.isOTA, outPath);
+}
 
 bool download_kernelcache_for(NSString *boardconfig, NSString *zipURL, bool isOTA, NSString *outPath) {
     NSError *error = nil;
@@ -99,36 +118,28 @@ bool download_kernelcache(NSString *zipURL, bool isOTA, NSString *outPath) {
 
 // TODO: Only require one of model identifier/boardconfig and use API to get the other?
 bool grab_kernelcache_for(NSString *osStr, NSString *build, NSString *modelIdentifier, NSString *boardconfig, NSString *outPath) {
-    bool isOTA = NO;
-    NSString *firmwareURL = getFirmwareURLFor(osStr, build, modelIdentifier, &isOTA);
-    if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL!\n");
-        return false;
-    }
-
-    return download_kernelcache_for(boardconfig, firmwareURL, isOTA, outPath);
+    FirmwareLink *link = getFirmwareLinkFor(osStr, build, modelIdentifier);
+    return grab_kernelcache_via_link(boardconfig, link, outPath);
 }
 
 bool grab_kernelcache(NSString *outPath) {
-    bool isOTA = NO;
-    NSString *firmwareURL = getFirmwareURL(&isOTA);
-    if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL!\n");
+    NSString *boardconfig = getBoardconfig();
+    if (!boardconfig) {
+        ERRLOG("Failed to get boardconfig!\n");
         return false;
     }
-
-    return download_kernelcache(firmwareURL, isOTA, outPath);
+    FirmwareLink *link = getFirmwareLink();
+    return grab_kernelcache_via_link(boardconfig, link, outPath);
 }
 
 bool grab_kernelcache_for_build_number(NSString *build, NSString *outPath) {
-    bool isOTA = NO;
-    NSString *firmwareURL = getFirmwareURLFor(getOsStr(), build, getModelIdentifier(), &isOTA);
-    if (!firmwareURL) {
-        ERRLOG("Failed to get firmware URL for build number!\n");
+    NSString *boardconfig = getBoardconfig();
+    if (!boardconfig) {
+        ERRLOG("Failed to get boardconfig!\n");
         return false;
     }
-
-    return download_kernelcache(firmwareURL, isOTA, outPath);
+    FirmwareLink *link = getFirmwareLinkFor(getOsStr(), build, getModelIdentifier());
+    return grab_kernelcache_via_link(boardconfig, link, outPath);
 }
 
 // libgrabkernel compatibility shim

@@ -11,12 +11,17 @@
 #import <UIKit/UIKit.h>
 #endif
 #import <sys/sysctl.h>
+#import "appledb.h"
+#import "appledb_internal.h"
 #import "utils.h"
 
 #define BASE_URL @"https://api.appledb.dev/ios/"
 #define ALL_VERSIONS BASE_URL @"main.json.xz"
 
 NSArray *hostsNeedingAuth = @[@"adcdownload.apple.com", @"download.developer.apple.com", @"developer.apple.com"];
+
+@implementation FirmwareLink
+@end
 
 static inline NSString *apiURLForBuild(NSString *osStr, NSString *build) {
     return [NSString stringWithFormat:@"https://api.appledb.dev/ios/%@;%@.json", osStr, build];
@@ -45,7 +50,7 @@ static NSData *makeSynchronousRequest(NSString *url, NSError **error) {
     return data;
 }
 
-static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *sources, NSString *modelIdentifier, bool *isOTA) {
+static FirmwareLink *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *sources, NSString *modelIdentifier) {
     for (NSDictionary<NSString *, id> *source in sources) {
         if (![source[@"deviceMap"] containsObject:modelIdentifier]) {
             DBGLOG("Skipping source that does not include device: %s\n", [source[@"deviceMap"] componentsJoinedByString:@", "].UTF8String);
@@ -75,11 +80,20 @@ static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *so
                 continue;
             }
 
-            if (isOTA) {
-                *isOTA = [source[@"type"] isEqualToString:@"ota"];
+            FirmwareLink *fl = [[FirmwareLink alloc] init];
+            fl.url = link[@"url"];
+            fl.isOTA = [source[@"type"] isEqualToString:@"ota"];
+            fl.isAEA = [url.pathExtension.lowercaseString isEqualToString:@"aea"];
+            id key = link[@"decryptionKey"];
+            if ([key isKindOfClass:[NSString class]]) {
+                fl.decryptionKey = key;
             }
-            LOG("Found firmware URL: %s (OTA: %s)\n", url.absoluteString.UTF8String, *isOTA ? "yes" : "no");
-            return link[@"url"];
+            LOG("Found firmware URL: %s (OTA: %s, AEA: %s, key: %s)\n",
+                fl.url.UTF8String,
+                fl.isOTA ? "yes" : "no",
+                fl.isAEA ? "yes" : "no",
+                fl.decryptionKey ? "yes" : "no");
+            return fl;
         }
 
         DBGLOG("No suitable links found for source: %s\n", [source[@"name"] UTF8String]);
@@ -88,7 +102,7 @@ static NSString *bestLinkFromSources(NSArray<NSDictionary<NSString *, id> *> *so
     return nil;
 }
 
-static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
+static FirmwareLink *getFirmwareLinkFromAll(NSString *osStr, NSString *build, NSString *modelIdentifier) {
     NSError *error = nil;
     NSData *compressed = makeSynchronousRequest(ALL_VERSIONS, &error);
     if (error) {
@@ -110,11 +124,11 @@ static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSStrin
 
     for (NSDictionary<NSString *, id> *firmware in json) {
         if ([firmware[@"osStr"] isEqualToString:osStr] && [firmware[@"build"] isEqualToString:build]) {
-            NSString *firmwareURL = bestLinkFromSources(firmware[@"sources"], modelIdentifier, isOTA);
-            if (!firmwareURL) {
+            FirmwareLink *fl = bestLinkFromSources(firmware[@"sources"], modelIdentifier);
+            if (!fl) {
                 DBGLOG("No suitable links found for firmware: %s\n", [firmware[@"key"] UTF8String]);
             } else {
-                return firmwareURL;
+                return fl;
             }
         }
     }
@@ -122,7 +136,7 @@ static NSString *getFirmwareURLFromAll(NSString *osStr, NSString *build, NSStrin
     return nil;
 }
 
-static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
+static FirmwareLink *getFirmwareLinkFromDirect(NSString *osStr, NSString *build, NSString *modelIdentifier) {
     NSString *apiURL = apiURLForBuild(osStr, build);
     if (!apiURL) {
         ERRLOG("Failed to get API URL!\n");
@@ -142,30 +156,25 @@ static NSString *getFirmwareURLFromDirect(NSString *osStr, NSString *build, NSSt
         return nil;
     }
 
-    NSString *firmwareURL = bestLinkFromSources(json[@"sources"], modelIdentifier, isOTA);
-    if (!firmwareURL) {
-        return nil;
-    }
-
-    return firmwareURL;
+    return bestLinkFromSources(json[@"sources"], modelIdentifier);
 }
 
-NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
-    NSString *firmwareURL = getFirmwareURLFromDirect(osStr, build, modelIdentifier, isOTA);
-    if (!firmwareURL) {
+FirmwareLink *getFirmwareLinkFor(NSString *osStr, NSString *build, NSString *modelIdentifier) {
+    FirmwareLink *fl = getFirmwareLinkFromDirect(osStr, build, modelIdentifier);
+    if (!fl) {
         DBGLOG("Failed to get firmware URL from direct API, checking all versions...\n");
-        firmwareURL = getFirmwareURLFromAll(osStr, build, modelIdentifier, isOTA);
+        fl = getFirmwareLinkFromAll(osStr, build, modelIdentifier);
     }
 
-    if (!firmwareURL) {
+    if (!fl) {
         ERRLOG("Failed to find a firmware URL!\n");
         return nil;
     }
 
-    return firmwareURL;
+    return fl;
 }
 
-NSString *getFirmwareURL(bool *isOTA) {
+FirmwareLink *getFirmwareLink(void) {
     NSString *osStr = getOsStr();
     NSString *build = getBuild();
     NSString *modelIdentifier = getModelIdentifier();
@@ -174,5 +183,28 @@ NSString *getFirmwareURL(bool *isOTA) {
         return nil;
     }
 
-    return getFirmwareURLFor(osStr, build, modelIdentifier, isOTA);
+    return getFirmwareLinkFor(osStr, build, modelIdentifier);
+}
+
+// Legacy shims preserved for ABI compatibility.
+NSString *getFirmwareURLFor(NSString *osStr, NSString *build, NSString *modelIdentifier, bool *isOTA) {
+    FirmwareLink *fl = getFirmwareLinkFor(osStr, build, modelIdentifier);
+    if (!fl) {
+        return nil;
+    }
+    if (isOTA) {
+        *isOTA = fl.isOTA;
+    }
+    return fl.url;
+}
+
+NSString *getFirmwareURL(bool *isOTA) {
+    FirmwareLink *fl = getFirmwareLink();
+    if (!fl) {
+        return nil;
+    }
+    if (isOTA) {
+        *isOTA = fl.isOTA;
+    }
+    return fl.url;
 }
