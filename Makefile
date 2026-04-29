@@ -43,8 +43,9 @@ OBJ_FILES := $(patsubst $(SRC_DIR)/%.m, $(BUILD_DIR)/%.o, $(SRC_FILES))
 DISABLE_TESTS ?= 0
 
 ifeq ($(DISABLE_TESTS), 0)
-TESTS_SUBDIRS := $(wildcard $(TESTS_SRC_DIR)/*)
+TESTS_SUBDIRS := $(filter-out $(TESTS_SRC_DIR)/aea,$(wildcard $(TESTS_SRC_DIR)/*))
 TESTS_BINARIES := $(patsubst $(TESTS_SRC_DIR)/%,$(TESTS_OUTPUT_DIR)/%,$(TESTS_SUBDIRS))
+TESTS_BINARIES += $(TESTS_OUTPUT_DIR)/aea_appledb_dynamic
 endif
 
 HEADER_OUTPUT_DIR := $(OUTPUT_DIR)/include
@@ -68,6 +69,14 @@ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.m
 ifeq ($(DISABLE_TESTS), 0)
 .SECONDEXPANSION:
 $(TESTS_OUTPUT_DIR)/%: $$(wildcard $(TESTS_SRC_DIR)/%/*.m) $(STATIC_LIB)
+	@mkdir -p $(@D)
+	@rm -rf $@
+	$(CC) $(CFLAGS) $(LDFLAGS) -I$(OUTPUT_DIR)/include -o $@ $^
+	@if [ "$(TARGET)" = "ios" ]; then \
+		ldid -S_external/ios/entitlements.plist $@; \
+	fi
+
+$(TESTS_OUTPUT_DIR)/aea_appledb_dynamic: $(TESTS_SRC_DIR)/aea/appledb_dynamic.m $(STATIC_LIB)
 	@mkdir -p $(@D)
 	@rm -rf $@
 	$(CC) $(CFLAGS) $(LDFLAGS) -I$(OUTPUT_DIR)/include -o $@ $^
